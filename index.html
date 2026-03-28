@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>3D Solar System</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #04061b;
+        overflow: hidden;
+        font-family: Arial, Helvetica, sans-serif;
+        user-select: none;
+      }
+      .wrap {
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      canvas {
+        width: 100vw;
+        height: 56.25vw;
+        max-height: 100vh;
+        max-width: 100vw;
+        display: block;
+        cursor: grab;
+      }
+      canvas:active {
+        cursor: grabbing;
+      }
+      .controls-hint {
+        position: absolute;
+        bottom: 18px;
+        left: 18px;
+        color: rgba(255, 255, 255, 0.55);
+        font-size: 12px;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <canvas id="scene" aria-label="3D Solar system animation"></canvas>
+    </div>
+    <div class="controls-hint">Drag to rotate 3D • Scroll to zoom</div>
+
+    <script>
+      const canvas = document.getElementById("scene");
+      const ctx = canvas.getContext("2d", { alpha: false });
+
+      const LOGICAL_W = 1000;
+      const LOGICAL_H = 500;
+
+      // Projection center: sun appears left like the reference.
+      const cx = LOGICAL_W * 0.2;
+      const cy = LOGICAL_H * 0.5;
+
+      // 3D camera (yaw/pitch + perspective).
+      const camera = { yaw: 0, pitch: 0.3, dist: 950 };
+
+      function clamp(v, min, max) {
+        return Math.max(min, Math.min(max, v));
+      }
+
+      function deg(d) {
+        return (d * Math.PI) / 180;
+      }
+      function speedMul(v) {
+        return v * 0.08;
+      }
+
+      // Textures.
+      const textureExts = ["png", "jpg", "jpeg", "webp"];
+      const textures = {}; // key -> HTMLImageElement
+
+      function loadImage(url) {
+        return new Promise((resolve, reject) => {
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+          img.onload = () => resolve(img);
+          img.onerror = () => reject(new Error("Image failed to load"));
+          img.src = url;
+        });
+      }
+
+      async function loadFirstTexture(baseName) {
+        for (const ext of textureExts) {
+          const url = `./assets-management/${baseName}.${ext}`;
+          try {
+            return await loadImage(url);
+          } catch {
+            // Try next extension.
+          }
+        }
+        throw new Error(`Texture not found for ${baseName}`);
+      }
+
+      // Planet data (ellipse in the XZ plane, y=0).
+      const planets = [
+        { key: "mercury", label: "MERCURY", color: "#c0a070", r: 6, orbitA: 80, orbitB: 36, angle: deg(205), speed: speedMul(1.0) },
+        { key: "venus", label: "VENUS", color: "#d18b4b", r: 8, orbitA: 110, orbitB: 55, angle: deg(150), speed: speedMul(0.78) },
+        { key: "earth", label: "EARTH", color: "#2a79b9", r: 8, orbitA: 150, orbitB: 70, angle: deg(335), speed: speedMul(0.62) },
+        { key: "mars", label: "MARS", color: "#b63b2c", r: 7, orbitA: 190, orbitB: 92, angle: deg(285), speed: speedMul(0.53) },
+        { key: "jupiter", label: "JUPITER", color: "#c9a66b", r: 16, orbitA: 280, orbitB: 135, angle: deg(20), speed: speedMul(0.38) },
+        { key: "saturn", label: "SATURN", color: "#d7c08a", r: 14, orbitA: 360, orbitB: 175, angle: deg(70), speed: speedMul(0.31) },
+        { key: "uranus", label: "URANUS", color: "#63b3c6", r: 12, orbitA: 430, orbitB: 205, angle: deg(305), speed: speedMul(0.25) },
+        { key: "neptune", label: "NEPTUNE", color: "#3d7fce", r: 11, orbitA: 480, orbitB: 225, angle: deg(90), speed: speedMul(0.215) },
+        { key: "pluto", label: "PLUTO", color: "#b9a082", r: 5.5, orbitA: 520, orbitB: 245, angle: deg(345), speed: speedMul(0.185) },
+      ];
+
+      // 3D stars for parallax.
+      const stars = new Array(260).fill(0).map(() => {
+        return {
+          x: (Math.random() - 0.5) * 1600,
+          y: (Math.random() - 0.5) * 700,
+          z: (Math.random() - 0.5) * 1600,
+          r: Math.random() < 0.12 ? 1.6 : 1.0,
+          a: 0.35 + Math.random() * 0.65,
+        };
+      });
+
+      // Camera rotations.
+      function rotateY(x, y, z, yaw) {
+        const cos = Math.cos(yaw);
+        const sin = Math.sin(yaw);
+        return { x: x * cos - z * sin, y, z: x * sin + z * cos };
+      }
+      function rotateX(x, y, z, pitch) {
+        const cos = Math.cos(pitch);
+        const sin = Math.sin(pitch);
+        return { x, y: y * cos - z * sin, z: y * sin + z * cos };
+      }
+
+      // Project world coords into screen space.
+      function project(x, y, z) {
+        let p = rotateY(x, y, z, camera.yaw);
+        p = rotateX(p.x, p.y, p.z, camera.pitch);
+
+        const depth = camera.dist - p.z;
+        const safeDepth = Math.max(40, depth);
+        const scale = camera.dist / safeDepth;
+
+        return { sx: cx + p.x * scale, sy: cy + p.y * scale, scale, z: p.z };
+      }
+
+      function resizeCanvas() {
+        const dpr = window.devicePixelRatio || 1;
+        const scale = Math.min(window.innerWidth / LOGICAL_W, window.innerHeight / LOGICAL_H);
+        const w = Math.floor(LOGICAL_W * scale);
+        const h = Math.floor(LOGICAL_H * scale);
+        canvas.style.width = `${w}px`;
+        canvas.style.height = `${h}px`;
+        canvas.width = Math.floor(LOGICAL_W * dpr);
+        canvas.height = Math.floor(LOGICAL_H * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+
+      function clear() {
+        ctx.fillStyle = "#04061b";
+        ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+      }
+
+      function drawStars() {
+        ctx.fillStyle = "#ffffff";
+        for (const s of stars) {
+          const p = project(s.x, s.y, s.z);
+          ctx.globalAlpha = Math.min(1, s.a * (p.scale * 0.6));
+          const rad = Math.max(0.5, s.r * p.scale * 0.15);
+          ctx.beginPath();
+          ctx.arc(p.sx, p.sy, rad, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      function drawOrbitEllipse(planet) {
+        const segments = 70;
+        ctx.beginPath();
+        for (let i = 0; i <= segments; i++) {
+          const t = (i / segments) * Math.PI * 2;
+          const x = Math.cos(t) * planet.orbitA;
+          const z = Math.sin(t) * planet.orbitB;
+          const p = project(x, 0, z);
+          if (i === 0) ctx.moveTo(p.sx, p.sy);
+          else ctx.lineTo(p.sx, p.sy);
+        }
+        ctx.strokeStyle = "rgba(210, 220, 255, 0.14)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+
+      function getPlanetWorldPosition(planet) {
+        const x = Math.cos(planet.angle) * planet.orbitA;
+        const z = Math.sin(planet.angle) * planet.orbitB;
+        return { x, y: 0, z };
+      }
+
+      function drawSun() {
+        const p = project(0, 0, 0);
+        const sunR = 85 * p.scale;
+        const g = ctx.createRadialGradient(p.sx, p.sy, sunR * 0.1, p.sx, p.sy, sunR);
+        g.addColorStop(0, "#ffb21f");
+        g.addColorStop(0.45, "#ff7f11");
+        g.addColorStop(1, "rgba(216, 76, 6, 0)");
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(p.sx, p.sy, sunR, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "#ff7f11";
+        ctx.beginPath();
+        ctx.arc(p.sx, p.sy, sunR * 0.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      function drawPlanetSphere(planet) {
+        const wp = getPlanetWorldPosition(planet);
+        const pp = project(wp.x, wp.y, wp.z);
+        const rPx = planet.r * pp.scale;
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(pp.sx, pp.sy, rPx, 0, Math.PI * 2);
+        ctx.clip();
+
+        const tex = textures[planet.key];
+        if (tex) {
+          ctx.drawImage(tex, pp.sx - rPx, pp.sy - rPx, rPx * 2, rPx * 2);
+        } else {
+          ctx.fillStyle = planet.color;
+          ctx.fillRect(pp.sx - rPx, pp.sy - rPx, rPx * 2, rPx * 2);
+        }
+        ctx.restore();
+
+        ctx.strokeStyle = "rgba(0,0,0,0.25)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(pp.sx, pp.sy, rPx, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Label.
+        ctx.fillStyle = "rgba(235, 245, 255, 0.95)";
+        ctx.font = "14px Arial";
+        ctx.textAlign = pp.sx > cx ? "left" : "right";
+        ctx.textBaseline = "bottom";
+        const dx = pp.sx > cx ? rPx + 8 : -rPx - 8;
+        ctx.fillText(planet.label, pp.sx + dx, pp.sy - rPx - 8);
+      }
+
+      function drawSaturnRings(saturn) {
+        const wp = getPlanetWorldPosition(saturn);
+        const ringR1 = saturn.r * 2.6;
+        const ringR2 = saturn.r * 3.4;
+        const ringTilt = deg(22);
+
+        function drawRing(R, strokeStyle, lineWidth, alpha) {
+          ctx.save();
+          ctx.globalAlpha = alpha;
+          ctx.strokeStyle = strokeStyle;
+          ctx.lineWidth = lineWidth;
+          ctx.beginPath();
+
+          const segments = 90;
+          for (let i = 0; i <= segments; i++) {
+            const a = (i / segments) * Math.PI * 2;
+            // Circle in XZ plane (y=0), then tilt around X.
+            let rx = Math.cos(a) * R;
+            let ry = 0;
+            let rz = Math.sin(a) * R;
+            const tilted = rotateX(rx, ry, rz, ringTilt);
+            const p = project(wp.x + tilted.x, wp.y + tilted.y, wp.z + tilted.z);
+            if (i === 0) ctx.moveTo(p.sx, p.sy);
+            else ctx.lineTo(p.sx, p.sy);
+          }
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // Behind planet.
+        drawRing(ringR2, "rgba(220, 210, 160, 0.55)", 2, 0.65);
+        drawRing(ringR1, "rgba(180, 170, 120, 0.45)", 1, 0.65);
+      }
+
+      function render() {
+        clear();
+        drawStars();
+        for (const p of planets) drawOrbitEllipse(p);
+        drawSun();
+
+        const saturn = planets.find((p) => p.key === "saturn");
+        if (saturn) drawSaturnRings(saturn);
+
+        // Z-order far -> near.
+        const drawList = planets
+          .map((p) => {
+            const wp = getPlanetWorldPosition(p);
+            const pp = project(wp.x, 0, wp.z);
+            return { p, z: pp.z };
+          })
+          .sort((a, b) => a.z - b.z);
+
+        for (const item of drawList) {
+          drawPlanetSphere(item.p);
+        }
+      }
+
+     
+      let isDragging = false;
+      let lastX = 0;
+      let lastY = 0;
+
+      canvas.addEventListener("pointerdown", (e) => {
+        isDragging = true;
+        lastX = e.clientX;
+        lastY = e.clientY;
+      });
+
+      window.addEventListener("pointermove", (e) => {
+        if (!isDragging) return;
+        const dx = e.clientX - lastX;
+        const dy = e.clientY - lastY;
+        lastX = e.clientX;
+        lastY = e.clientY;
+
+        camera.yaw += dx * 0.005;
+        camera.pitch += dy * 0.005;
+        camera.pitch = clamp(camera.pitch, -Math.PI / 2, Math.PI / 2);
+      });
+
+      window.addEventListener("pointerup", () => {
+        isDragging = false;
+      });
+      window.addEventListener("pointercancel", () => {
+        isDragging = false;
+      });
+
+      canvas.addEventListener(
+        "wheel",
+        (e) => {
+          e.preventDefault();
+          camera.dist += e.deltaY * 0.5;
+          camera.dist = clamp(camera.dist, 520, 1800);
+        },
+        { passive: false }
+      );
+
+      // Load textures (color fallback if unavailable).
+      (async () => {
+        await Promise.all(
+          planets.map(async (p) => {
+            try {
+              textures[p.key] = await loadFirstTexture(p.key);
+            } catch {
+              // Keep color fallback.
+            }
+          })
+        );
+      })();
+
+      function animate(t) {
+        if (!animate.lastT) animate.lastT = t;
+        const dt = (t - animate.lastT) / 1000;
+        animate.lastT = t;
+
+        for (const p of planets) p.angle += p.speed * dt;
+        render();
+        requestAnimationFrame(animate);
+      }
+
+      window.addEventListener("resize", () => {
+        resizeCanvas();
+        render();
+      });
+
+      resizeCanvas();
+      render();
+      requestAnimationFrame(animate);
+    </script>
+  </body>
+</html>
